@@ -5,30 +5,33 @@ import torch
 import torch.nn.functional as F
 import quadsim_cuda
 
-
-class GDecay(torch.autograd.Function):
+# 梯度衰减层，类似于model.py x*alpha + x.detach()*(1-alpha) 的写法
+class GDecay(torch.autograd.Function):  #想要自己定义某个操作的前向和反向传播，就需要继承 torch.autograd.Function
     @staticmethod
     def forward(ctx, x, alpha):
-        ctx.alpha = alpha
+        ctx.alpha = alpha   #衰减因子
         return x
 
     @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output * ctx.alpha, None
+    def backward(ctx, grad_output): #grad_output 是链式法则里从后面传回来的梯度
+        # 返回的是相对于 forward 函数输入的梯度，这里是 x 的梯度和 alpha 的梯度
+        return grad_output * ctx.alpha, None   
 
-g_decay = GDecay.apply
+g_decay = GDecay.apply  #起别名     .apply -> 执行 forward，同时在计算图里注册 backward
 
 
 class RunFunction(torch.autograd.Function):
+    #调用 quadsim_cuda.run_forward（应该是 C++/CUDA 写的四旋翼动力学仿真函数），返回动作、位置、速度、加速度。
     @staticmethod
     def forward(ctx, R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, grad_decay, ctl_dt, airmode):
         act_next, p_next, v_next, a_next = quadsim_cuda.run_forward(
             R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, ctl_dt, airmode)
+        #上下文对象 ctx 用于在 forward 和 backward 之间传递信息
         ctx.save_for_backward(R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next)
         ctx.grad_decay = grad_decay
         ctx.ctl_dt = ctl_dt
         return act_next, p_next, v_next, a_next
-
+    #调用 quadsim_cuda.run_backward，把梯度传回去
     @staticmethod
     def backward(ctx, d_act_next, d_p_next, d_v_next, d_a_next):
         R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next = ctx.saved_tensors
@@ -286,13 +289,13 @@ class Env:
                             self.p_old, self.drone_radius, self.n_drones_per_group,
                             self._fov_x_half_tan)
         return canvas, None
-
+    #计算无人机到障碍的向量
     def find_vec_to_nearest_pt(self):
         p = self.p + self.v * self.sub_div
         nearest_pt = torch.empty_like(p)
         quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
         return nearest_pt - p
-
+    #调用 CUDA 仿真一步，更新状态
     def run(self, act_pred, ctl_dt=1/15, v_pred=None):
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
@@ -304,7 +307,7 @@ class Env:
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
         self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
-
+    #PyTorch 原生实现仿真（可微分）
     def _run(self, act_pred, ctl_dt=1/15, v_pred=None):
         alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
         self.act = act_pred * (1 - alpha) + self.act * alpha
