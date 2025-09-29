@@ -22,7 +22,7 @@ class Model(nn.Module):
         self.v_proj.weight.data.mul_(0.5)# 初始化时缩小权重幅度一半，避免输入太大
 
         self.gru = nn.GRUCell(192, 192)  # 输入是192维，隐状态也是192维，记忆单元
-        self.fc = nn.Linear(192, dim_action, bias=False)    # 最终映射到动作空间
+        self.fc = nn.Linear(192, dim_action, bias=False)    # 最终映射到动作空间，策略头：把时序特征转换为动作
         self.fc.weight.data.mul_(0.01)  # 输出层权重初始化得很小，避免初始动作过大
         self.act = nn.LeakyReLU(0.05)   # 激活函数，负数部分留一点梯度
 
@@ -31,7 +31,7 @@ class Model(nn.Module):
 
     def forward(self, x: torch.Tensor, v, hx=None):
         img_feat = self.stem(x) #1. 图像输入提取特征
-        x = self.act(img_feat + self.v_proj(v))  # 2. 拼接额外观测 v 的投影，并激活
+        x = self.act(img_feat + self.v_proj(v))  # 2. 拼接额外观测 v 的投影，多模态
         hx = self.gru(x, hx)    # 3. 传入 GRUCell，更新隐状态
         act = self.fc(self.act(hx))  # 4. 映射到动作空间，并激活
         return act, None, hx
