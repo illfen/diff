@@ -7,6 +7,18 @@
 
 namespace {
 
+// 这个 kernel 更新旋转矩阵 R_new，主要做了：
+// 从输入加速度 a_thr 里扣掉重力，算推力向量。
+// 单位化得到机体“up 向量” (ux, uy, uz)。
+// 根据预测速度 v_pred + 原 forward 方向（带 yaw_inertia）得到新的 forward 向量。
+// 和 alpha 做插值（融合历史 forward_vec 和当前计算的方向）。
+// 重新调整 fz，保证 forward 向量和 up 向量正交。
+// 单位化 forward 向量。
+// 用 叉乘 构造完整的正交基：
+// forward_vec
+// left_vec = up × forward
+// up_vec
+// 最终把这三个向量写入 R_new，相当于更新了飞行器的朝向矩阵。
 template <typename scalar_t>
 __global__ void update_state_vec_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> R_new,
@@ -16,7 +28,7 @@ __global__ void update_state_vec_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> alpha,
     float yaw_inertia) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    const int B = R.size(0);
+    const int B = R.size(0);    //每个线程负责处理第 i 个样本，如果超过 batch 范围就退出
     if (b >= B) return;
     // a_thr = a_thr - self.g_std;
     scalar_t ax = a_thr[b][0];
@@ -28,7 +40,8 @@ __global__ void update_state_vec_cuda_kernel(
     scalar_t ux = ax / thrust;
     scalar_t uy = ay / thrust;
     scalar_t uz = az / thrust;
-    // forward_vec = self.forward_vec * yaw_inertia + v_pred;
+    // forward_vec = self.forward_vec * yaw_inertia + v_pred;   
+    // 带偏航惯性
     scalar_t fx = R[b][0][0] * yaw_inertia + v_pred[b][0];
     scalar_t fy = R[b][1][0] * yaw_inertia + v_pred[b][1];
     scalar_t fz = R[b][2][0] * yaw_inertia + v_pred[b][2];
@@ -60,35 +73,38 @@ __global__ void update_state_vec_cuda_kernel(
 
 template <typename scalar_t>
 __global__ void run_forward_cuda_kernel(
-    torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> R,
+    torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> R,//当前姿态旋转矩阵（机体 → 世界）
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> dg,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> z_drag_coef,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> drag_2,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> pitch_ctl_delay,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> act_pred,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> act,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> z_drag_coef,//垂直方向阻力系数
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> drag_2,//阻力二阶和一次系数（对应平方阻力、线性阻力）
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> pitch_ctl_delay,//控制输入延迟常数
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> act_pred,//预测的控制加速度（下一步目标 thrust）
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> act,//当前控制加速度
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> p,
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> v,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> v_wind,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> v_wind,//当前风速（世界系）
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> a,
-    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> act_next,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> act_next,//下一时刻
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> p_next,
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> v_next,
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> a_next,
-    float ctl_dt, float airmode_av2a) {
+    float ctl_dt, float airmode_av2a) {//控制步长；airmode 增益，用于将角速度项映射成加速度补偿
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int B = R.size(0);
     if (i >= B) return;
     // alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
+    // 控制延迟
     scalar_t alpha = exp(-pitch_ctl_delay[i][0] * ctl_dt);
     // self.act = act_pred * (1 - alpha) + self.act * alpha
     for (int j=0; j<3; j++)
-        act_next[i][j] = act_pred[i][j] * (1 - alpha) + act[i][j] * alpha;
+        act_next[i][j] = act_pred[i][j] * (1 - alpha) + act[i][j] * alpha;  //一阶低通滤波
     // self.dg = self.dg * math.sqrt(1 - ctl_dt) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt)
     // v_up = torch.sum(self.v * self.R[..., 2], -1, keepdim=True) * self.R[..., 2]
+    // 计算相对风速
     scalar_t v_rel_wind_x = v[i][0] - v_wind[i][0];
     scalar_t v_rel_wind_y = v[i][1] - v_wind[i][1];
     scalar_t v_rel_wind_z = v[i][2] - v_wind[i][2];
+    // 在机体系中分解速度分量
     scalar_t v_up_s = v_rel_wind_x * R[i][0][2] + v_rel_wind_y * R[i][1][2] + v_rel_wind_z * R[i][2][2];
     // scalar_t v_up[3]
     // for (int j=0; j<3; j++){
@@ -96,10 +112,11 @@ __global__ void run_forward_cuda_kernel(
     // }
     scalar_t v_fwd_s = v_rel_wind_x * R[i][0][0] + v_rel_wind_y * R[i][1][0] + v_rel_wind_z * R[i][2][0];
     scalar_t v_left_s = v_rel_wind_x * R[i][0][1] + v_rel_wind_y * R[i][1][1] + v_rel_wind_z * R[i][2][1];
+    // 计算空气阻力，平方阻力方向与速度相反，因此取 v * |v|
     scalar_t v_up_2 = v_up_s * abs(v_up_s);
     scalar_t v_fwd_2 = v_fwd_s * abs(v_fwd_s);
     scalar_t v_left_2 = v_left_s * abs(v_left_s);
-
+    // 再组合成三维阻力加速度，a_drag_2 → 二次阻力项（平方阻力），a_drag_1 → 一次阻力项（线性阻力），z_drag_coef → 调节竖直方向阻力更大（上升下降空气阻力）
     scalar_t a_drag_2[3], a_drag_1[3];
     for (int j=0; j<3; j++){
         a_drag_2[j] = v_up_2 * R[i][j][2] * z_drag_coef[i][0] + v_left_2 * R[i][j][1] + v_fwd_2 * R[i][j][0];
@@ -110,6 +127,7 @@ __global__ void run_forward_cuda_kernel(
     // for (int j=0; j<3; j++)
     //     v_prep[j] = v[i][j] - v_up[j];
     // motor_velocity = (self.act - self.g_std).norm(2, -1, True).sqrt()
+    // 计算 “airmode” 加速度项（推力变化引起的角速度修正）
     scalar_t dot = act[i][0] * act_next[i][0] + act[i][1] * act_next[i][1] + (act[i][2] + 9.80665) * (act_next[i][2] + 9.80665);
     scalar_t n1 = act[i][0] * act[i][0] + act[i][1] * act[i][1] + (act[i][2] + 9.80665) * (act[i][2] + 9.80665);
     scalar_t n2 = act_next[i][0] * act_next[i][0] + act_next[i][1] * act_next[i][1] + (act_next[i][2] + 9.80665) * (act_next[i][2] + 9.80665);
@@ -118,6 +136,7 @@ __global__ void run_forward_cuda_kernel(
     scalar_t ax = act[i][0];
     scalar_t ay = act[i][1];
     scalar_t az = act[i][2] + 9.80665;
+    // 这一步构造了一个与当前推力方向一致的加速度补偿项 → 模拟快速姿态变化时，推力方向改变造成的惯性效应（airmode）。
     scalar_t thrust = sqrt(ax*ax+ay*ay+az*az);
     scalar_t airmode_a[3] = {
         ax / thrust * av * airmode_av2a,
