@@ -213,16 +213,18 @@ __global__ void run_backward_cuda_kernel(
     // // self.v = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
     // for (int j=0; j<3; j++)
     //     v_next[i][j] = v[i][j] + 0.5 * (a[i][j] + a_next[i][j]) * ctl_dt;
-
+    // 把上游对 act_next、a_next 的梯度读入局部数组（用于后续累计）
     scalar_t d_act_next[3] = {_d_act_next[i][0], _d_act_next[i][1], _d_act_next[i][2]};
     scalar_t d_a_next[3] = {_d_a_next[i][0], _d_a_next[i][1], _d_a_next[i][2]};
     // backward starts here
+    // v_next的反向
     for (int j=0; j<3; j++){
         // v_next[i][j] = v[i][j] + 0.5 * (a[i][j] + a_next[i][j]) * ctl_dt;
-        d_v[i][j] = d_v_next[i][j] * pow(grad_decay, ctl_dt);
+        d_v[i][j] = d_v_next[i][j] * pow(grad_decay, ctl_dt);   // 梯度衰减
         d_a[i][j] = 0.5 * ctl_dt * d_v_next[i][j];
         d_a_next[j] += 0.5 * ctl_dt * d_v_next[i][j];
     }
+    // p_next的反向
     for (int j=0; j<3; j++){
         // p_next[i][j] = p[i][j] + v[i][j] * ctl_dt + 0.5 * a[i][j] * ctl_dt * ctl_dt;
         d_p[i][j] = d_p_next[i][j] * pow(grad_decay, ctl_dt);
@@ -254,6 +256,7 @@ __global__ void run_backward_cuda_kernel(
     scalar_t d_v_fwd_s = 0;
     scalar_t d_v_left_s = 0;
     scalar_t d_v_up_s = 0;
+    // 再反向计算 d_v_fwd_s, d_v_left_s, d_v_up_s 并最终累加到 d_v[i][j]（当前时刻速度的梯度）
     for (int j=0; j<3; j++){
         // a_drag_2[j] = v_up_s * v_up_s * R[i][j][2] * z_drag_coef[i][0] + v_left_s * v_left_s * R[i][j][1] + v_fwd_s * v_fwd_s * R[i][j][0];
         d_v_fwd_s += d_a_drag_2[j] * 2 * abs(v_fwd_s) * R[i][j][0];
@@ -275,6 +278,7 @@ __global__ void run_backward_cuda_kernel(
     //     d_v_up_s += d_v_up[j] * R[i][j][2];
     // }
     // scalar_t v_up_s = v[i][0] * R[i][0][2] + v[i][1] * R[i][1][2] + v[i][2] * R[i][2][2];
+    // 投影回世界坐标系
     for (int j=0; j<3; j++){
         d_v[i][j] += R[i][j][0] * d_v_fwd_s;
         d_v[i][j] += R[i][j][1] * d_v_left_s;
@@ -289,6 +293,7 @@ __global__ void run_backward_cuda_kernel(
 
 } // namespace
 
+// 通过 PyTorch 的自定义算子机制（C++ 扩展接口）调用一个 GPU 核函数 run_forward_cuda_kernel 来进行批量并行计算
 std::vector<torch::Tensor> run_forward_cuda(
     torch::Tensor R,
     torch::Tensor dg,
@@ -357,6 +362,7 @@ std::vector<torch::Tensor> run_backward_cuda(
 
     const int threads = R.size(0);
     const dim3 blocks(1);
+    // 类型派发宏
     AT_DISPATCH_FLOATING_TYPES(R.type(), "run_backward_cuda", ([&] {
         run_backward_cuda_kernel<scalar_t><<<blocks, threads>>>(
             R.packed_accessor<scalar_t,3,torch::RestrictPtrTraits,size_t>(),

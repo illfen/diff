@@ -8,6 +8,10 @@
 namespace {
 
 template <typename scalar_t>
+// CUDA 光线投射（raycasting）渲染核函数
+// 每个线程对应图像中的一个像素 (u, v)，从无人机相机中心发出一条射线
+// 判断射线与场景中各种障碍物（球、圆柱、盒子）是否相交，取最近的交点距离作为深度值
+// 最终输出:canvas[b][u][v] = 最接近该像素方向上的障碍物距离
 __global__ void render_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> canvas,
     torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> flow,
@@ -24,28 +28,32 @@ __global__ void render_cuda_kernel(
     float fov_x_half_tan) {
 
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int B = canvas.size(0);
+    const int B = canvas.size(0);   //batch大小，对应无人机数量
     const int H = canvas.size(1);
     const int W = canvas.size(2);
     if (c >= B * H * W) return;
+    // 把一维索引 c 映射回三维坐标(b, u, v)
     const int b = c / (H * W);
     const int u = (c % (H * W)) / W;
     const int v = c % W;
+    // 已知横向 FOV 的半角 tan(θ_x/2)，根据分辨率比例得到纵向半角
     const scalar_t fov_y_half_tan = fov_x_half_tan / W * H;
+    // 计算射线方向
     const scalar_t fu = (2 * (u + 0.5) / H - 1) * fov_y_half_tan - 1e-5;
     const scalar_t fv = (2 * (v + 0.5) / W - 1) * fov_x_half_tan - 1e-5;
     scalar_t dx = R[b][0][0] - fu * R[b][0][2] - fv * R[b][0][1];
     scalar_t dy = R[b][1][0] - fu * R[b][1][2] - fv * R[b][1][1];
     scalar_t dz = R[b][2][0] - fu * R[b][2][2] - fv * R[b][2][1];
+    // 获取相机位置
     const scalar_t ox = pos[b][0];
     const scalar_t oy = pos[b][1];
     const scalar_t oz = pos[b][2];
 
     scalar_t min_dist = 100;
-    scalar_t  t = (-1 - oz) / dz;
+    scalar_t  t = (-1 - oz) / dz;   //这是假设地面 z = -1，计算射线是否击中地面
     if (t > 0) min_dist = t;
 
-    // others
+    // others 检测其他无人机
     const int batch_base = (b / n_drones_per_group) * n_drones_per_group;
     for (int i = batch_base; i < batch_base + n_drones_per_group; i++) {
         if (i == b || i >= B) continue;
@@ -158,6 +166,7 @@ __global__ void render_cuda_kernel(
 }
 
 template <typename scalar_t>
+// 为每个无人机（或点）计算它在场景中距离最近的障碍物表面点（nearest point）
 __global__ void nearest_pt_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> nearest_pt,
     torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> balls,
@@ -180,7 +189,7 @@ __global__ void nearest_pt_cuda_kernel(
     const scalar_t oy = pos[j][b][1];
     const scalar_t oz = pos[j][b][2];
 
-    scalar_t min_dist = max(1e-3f, oz + 1);
+    scalar_t min_dist = max(1e-3f, oz + 1); //初始最近距离设得很大
     scalar_t nearest_ptx = ox;
     scalar_t nearest_pty = oy;
     scalar_t nearest_ptz = min(-1., oz - 1e-3f);
@@ -193,7 +202,7 @@ __global__ void nearest_pt_cuda_kernel(
         scalar_t cy = pos[j][i][1];
         scalar_t cz = pos[j][i][2];
         scalar_t r = 0.15;
-        scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);
+        scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);//4* 竖直方向更敏感
         dist = max(1e-3f, sqrt(dist) - r);
         if (dist < min_dist) {
             min_dist = dist;
@@ -268,6 +277,7 @@ __global__ void nearest_pt_cuda_kernel(
             nearest_ptz = ptz;
         }
     }
+    // 最终输出最近点
     nearest_pt[j][b][0] = nearest_ptx;
     nearest_pt[j][b][1] = nearest_pty;
     nearest_pt[j][b][2] = nearest_ptz;
@@ -275,6 +285,7 @@ __global__ void nearest_pt_cuda_kernel(
 
 
 template <typename scalar_t>
+// 下采样后深度图的梯度/法向量预处理
 __global__ void rerender_backward_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> depth,
     torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> dddp,
@@ -290,7 +301,10 @@ __global__ void rerender_backward_cuda_kernel(
     const int v = c % W;
 
     const scalar_t unit = fov_x_half_tan / W;
+    // 每个2x2块的深度值平均作为该像素的深度，并用unit缩放
     const scalar_t d = (depth[b][0][u*2][v*2] + depth[b][0][u*2+1][v*2] + depth[b][0][u*2][v*2+1] + depth[b][0][u*2+1][v*2+1]) / 4 * unit;
+    // 特定差分滤波，把 2×2 的四个值做线性组合得到 y、z 的局部梯度近似
+    // 然后除以 2，最后再除以 d（归一化到相对深度尺度）
     const scalar_t dddy = (depth[b][0][u*2][v*2] + depth[b][0][u*2+1][v*2] - depth[b][0][u*2][v*2+1] - depth[b][0][u*2+1][v*2+1]) / 2 / d;
     const scalar_t dddz = (depth[b][0][u*2][v*2] - depth[b][0][u*2+1][v*2] + depth[b][0][u*2][v*2+1] - depth[b][0][u*2+1][v*2+1]) / 2 / d;
     // if ReRender.diff_kernel is None:
@@ -350,7 +364,8 @@ void render_cuda(
             fov_x_half_tan);
     }));
 }
-
+// CUDA kernel 启动器（launcher），它的作用是：
+// 在 GPU 上启动 rerender_backward_cuda_kernel，并传入张量和参数
 void rerender_backward_cuda(
     torch::Tensor depth,
     torch::Tensor dddp,
@@ -366,7 +381,7 @@ void rerender_backward_cuda(
             fov_x_half_tan);
     }));
 }
-
+// 在 GPU 上并行计算每个无人机（或点）到场景中最近障碍物（球体、圆柱体、体素、其他无人机）的最近点坐标·
 void find_nearest_pt_cuda(
     torch::Tensor nearest_pt,
     torch::Tensor balls,
