@@ -108,6 +108,7 @@ for i in pbar:  #外层循环：训练迭代次数（episode） args.num_iters�
     act_buffer = [env.act] * (act_lag + 1)  #动作缓冲区，模拟控制延迟
     target_v_raw = env.p_target - env.p #初始目标速度 = 目标位置 - 当前无人机位置
     if args.yaw_drift:
+        # torch.randn(B)：生成 B 个服从标准正态分布（均值0，方差1）的随机数
         drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 / 15)
         zeros = torch.zeros_like(drift_av)
         ones = torch.ones_like(drift_av)
@@ -121,8 +122,8 @@ for i in pbar:  #外层循环：训练迭代次数（episode） args.num_iters�
     for t in range(args.timesteps): #内层循环：环境步长 args.timesteps，每次迭代表示无人机在仿真中的一步。
         ctl_dt = normalvariate(1 / 15, 0.1 / 15)    # 控制周期带噪声
         depth, flow = env.render(ctl_dt)    # 渲染深度图、光流
-        p_history.append(env.p) #无人机位置
-        vec_to_pt_history.append(env.find_vec_to_nearest_pt())#无人机到最近障碍物的向量
+        p_history.append(env.p) # 无人机位置
+        vec_to_pt_history.append(env.find_vec_to_nearest_pt())# 无人机到最近障碍物的向量
 
         if is_save_iter(i):
             vid.append(depth[4])
@@ -134,28 +135,31 @@ for i in pbar:  #外层循环：训练迭代次数（episode） args.num_iters�
         env.run(act_buffer[t], ctl_dt, target_v_raw)    #执行动作，并推进环境一步
 
         R = env.R
-        fwd = env.R[:, :, 0].clone()    # 机体系前向向量
+        fwd = env.R[:, :, 0].clone()    # 机体系前向向量 [B, 3]
         up = torch.zeros_like(fwd)
-        fwd[:, 2] = 0   # 投影到水平面
-        up[:, 2] = 1
+        fwd[:, 2] = 0   # 把每个前向向量的 z 分量置零，让前向方向 完全位于水平面上（x-y 平面）
+        up[:, 2] = 1    # 把每个“上方向”的 z 分量设为1，让“up”朝世界坐标系的 +Z 方向
         fwd = F.normalize(fwd, 2, -1)
+        # 这三个方向向量作为列堆叠成旋转矩阵
         R = torch.stack([fwd, torch.cross(up, fwd), up], -1)    # 正交基
 
         target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
         target_v_unit = target_v_raw / target_v_norm
         target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)
         state = [
+            # target_v[:, None]增加一个维度，变成[B, 1, 3]，R是[B, 3, 3]，矩阵乘法后变成[B, 1, 3]
+            # 再用 torch.squeeze 去掉第1个维度，变回[B, 3]
             torch.squeeze(target_v[:, None] @ R, 1),    # 目标速度在机体系坐标下
             env.R[:, 2],                                # 无人机朝向的 z 轴（俯仰姿态）
             env.margin[:, None]]                        # 安全边界
         local_v = torch.squeeze(env.v[:, None] @ R, 1)  # 当前速度在机体系下
         if not args.no_odom:
-            state.insert(0, local_v)    # 是否使用里程计
+            state.insert(0, local_v)    # 把 local_v 插入到列表开头（索引 0）
         state = torch.cat(state, -1)    # 拼接成最终状态向量
 
         # normalize,    depth 预处理：将深度图转为类似稀疏代价图的输入特征  clamp_(0.3, 24)：裁剪深度范围
         x = 3 / depth.clamp_(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02
-        x = F.max_pool2d(x[:, None], 4, 4)  #降采样，保留局部极大值。
+        x = F.max_pool2d(x[:, None], 4, 4)  # [B, 1, H, W],降采样，保留局部极大值。
         act, values, h = model(x, state, h) # 前向传播
         # 把动作从机体系转到世界坐标系 在最后一维切开成多个 tensor
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
